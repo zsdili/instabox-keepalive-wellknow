@@ -1,0 +1,64 @@
+name: InstaBox Keepalive
+
+# 每 5 分钟自动续租一次，让 InstaBox 免费机器保持 running，不被 30 分钟空闲挂起。
+# 同时配有手动触发按钮（workflow_dispatch），方便随时自检。
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: instabox-keepalive
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Renew activity lease
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+          INSTABOX_API_URL: https://api.instabox.sh
+          LEASE_NAME: keepalive
+          LEASE_TTL: '900'
+        run: |
+          set -eu
+          [ -n "$INSTABOX_API_KEY" ] || { echo "缺少 Secret: INSTABOX_API_KEY"; exit 1; }
+
+          API="$INSTABOX_API_URL"
+          echo "== $(date -u +%FT%TZ) 开始保活自检 =="
+
+          # 列出账号下所有机器，逐台续租（机器名可不填，自动覆盖全部）
+          machines=$(curl -fsS -m 30 -H "X-API-Key: $INSTABOX_API_KEY" "$API/v1/machines")
+          ids=$(printf '%s' "$machines" | jq -r '.[].id')
+
+          if [ -z "$ids" ]; then
+            echo "没有找到任何机器，检查 API key 是否正确"; exit 1
+          fi
+
+          fail=0
+          for id in $ids; do
+            name=$(printf '%s' "$machines" | jq -r --arg id "$id" '.[] | select(.id==$id) | .name')
+            state=$(printf '%s' "$machines" | jq -r --arg id "$id" '.[] | select(.id==$id) | .state')
+            echo "机器: $name ($id) 当前状态: $state"
+
+            if [ "$state" != "running" ]; then
+              echo "  机器未运行，尝试 resume..."
+              curl -fsS -m 30 -X POST -H "X-API-Key: $INSTABOX_API_KEY" \
+                "$API/v1/machines/$id/resume" >/dev/null 2>&1 || true
+              sleep 8
+            fi
+
+            code=$(curl -sS -m 30 -o /tmp/lease.out -w '%{http_code}' \
+              -X PUT -H "X-API-Key: $INSTABOX_API_KEY" -H 'Content-Type: application/json' \
+              -d "{\"ttlSeconds\":$LEASE_TTL}" \
+              "$API/v1/machines/$id/activity-leases/$LEASE_NAME" || echo 000)
+            echo "  续租 HTTP $code 响应: $(cat /tmp/lease.out)"
+            [ "$code" = "200" ] || [ "$code" = "204" ] || fail=1
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            echo "部分机器续租失败"; exit 1
+          fi
+          echo "== 全部机器续租成功 =="
