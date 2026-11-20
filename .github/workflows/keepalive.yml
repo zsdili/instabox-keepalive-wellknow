@@ -18,12 +18,12 @@ jobs:
           API="https://api.instabox.sh"
           echo "== $(date -u +%FT%TZ) keepalive start =="
           machines=$(curl -fsS -m 30 -H "X-API-Key: $INSTABOX_API_KEY" "$API/v1/machines")
-          ids=$(printf '%s' "$machines" | jq -r '.[].id')
+          ids=$(printf '%s' "$machines" | jq -r '.machines[].id')
           [ -n "$ids" ] || { echo "No machines found"; exit 1; }
           fail=0
           for id in $ids; do
-            name=$(printf '%s' "$machines" | jq -r --arg id "$id" '.[] | select(.id==$id) | .name')
-            state=$(printf '%s' "$machines" | jq -r --arg id "$id" '.[] | select(.id==$id) | .state')
+            name=$(printf '%s' "$machines" | jq -r --arg id "$id" '.machines[] | select(.id==$id) | .name')
+            state=$(printf '%s' "$machines" | jq -r --arg id "$id" '.machines[] | select(.id==$id) | .state')
             echo "machine: $name ($id) state: $state"
             if [ "$state" != "running" ]; then
               echo "  not running, resuming..."
