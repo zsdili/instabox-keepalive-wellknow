@@ -62,3 +62,4 @@ jobs:
             echo "部分机器续租失败"; exit 1
           fi
           echo "== 全部机器续租成功 =="
+# keepalive workflow
