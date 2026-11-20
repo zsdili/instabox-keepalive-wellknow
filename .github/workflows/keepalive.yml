@@ -12,6 +12,7 @@ jobs:
       - name: Renew activity lease
         env:
           INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           set -eu
           [ -n "$INSTABOX_API_KEY" ] || { echo "Missing secret INSTABOX_API_KEY"; exit 1; }
@@ -26,8 +27,13 @@ jobs:
             state=$(printf '%s' "$machines" | jq -r --arg id "$id" '.machines[] | select(.id==$id) | .state')
             echo "machine: $name ($id) state: $state"
             if [ "$state" != "running" ]; then
-              echo "  not running, resuming..."
-              curl -fsS -m 30 -X POST -H "X-API-Key: $INSTABOX_API_KEY" "$API/v1/machines/$id/resume" >/dev/null 2>&1 || true
+              echo "  not running, resuming (with Idempotency-Key)..."
+              rcode=$(curl -sS -m 30 -o /tmp/resume.out -w '%{http_code}' \
+                -X POST -H "X-API-Key: $INSTABOX_API_KEY" \
+                -H "Idempotency-Key: gh-${GITHUB_RUN_ID:-manual}-$id" \
+                "$API/v1/machines/$id/resume" || echo 000)
+              echo "  resume HTTP $rcode: $(head -c 300 /tmp/resume.out 2>/dev/null)"
+              [ "$rcode" = "200" ] || [ "$rcode" = "202" ] || fail=1
               sleep 8
             fi
             code=$(curl -sS -m 30 -o /tmp/lease.out -w '%{http_code}' \
