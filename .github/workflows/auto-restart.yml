@@ -1,0 +1,73 @@
+name: InstaBox Auto Restart
+
+# 每 6 小时主动 suspend→resume，重置 maxRunMinutes 计时器，避免跑满上限被强制冷却。
+# suspend/resume 保留内存与进程（无损），实测 runStartedAt 会刷新、服务 uptime 连续。
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refresh runtime window (suspend -> resume)
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -eu
+          [ -n "$INSTABOX_API_KEY" ] || { echo "Missing secret INSTABOX_API_KEY"; exit 1; }
+          API="https://api.instabox.sh"
+          KEY="$INSTABOX_API_KEY"
+          IDEM="gh-${GITHUB_RUN_ID}"
+
+          echo "== $(date -u +%FT%TZ) auto-restart start =="
+
+          machines=$(curl -fsS -m 30 -H "X-API-Key: $KEY" "$API/v1/machines")
+          ids=$(printf '%s' "$machines" | jq -r '.machines[].id')
+          [ -n "$ids" ] || { echo "No machines found"; exit 1; }
+
+          fail=0
+          for id in $ids; do
+            name=$(printf '%s' "$machines" | jq -r --arg id "$id" '.machines[] | select(.id==$id) | .name')
+            state=$(printf '%s' "$machines" | jq -r --arg id "$id" '.machines[] | select(.id==$id) | .state')
+            echo "machine: $name ($id) state: $state"
+
+            # 若处于冷却期，跳过（冷却期内无法唤醒，等下一轮）
+            cooldown=$(printf '%s' "$machines" | jq -r --arg id "$id" '.machines[] | select(.id==$id) | .cooldownUntil // empty')
+            if [ -n "$cooldown" ]; then
+              now_epoch=$(date -u +%s)
+              cd_epoch=$(date -u -d "$cooldown" +%s 2>/dev/null || echo 0)
+              if [ "$cd_epoch" -gt "$now_epoch" ]; then
+                echo "  in cooldown until $cooldown, skip this round"
+                continue
+              fi
+            fi
+
+            # 1) suspend
+            scode=$(curl -sS -m 30 -o /tmp/susp.out -w '%{http_code}' \
+              -X POST -H "X-API-Key: $KEY" -H "Idempotency-Key: ${IDEM}-suspend-$id" \
+              "$API/v1/machines/$id/suspend" || echo 000)
+            echo "  suspend HTTP $scode: $(head -c 200 /tmp/susp.out 2>/dev/null)"
+            [ "$scode" = "200" ] || [ "$scode" = "202" ] || { fail=1; continue; }
+            sleep 8
+
+            # 2) resume（幂等键与 suspend 不同，确保是独立操作）
+            rcode=$(curl -sS -m 30 -o /tmp/res.out -w '%{http_code}' \
+              -X POST -H "X-API-Key: $KEY" -H "Idempotency-Key: ${IDEM}-resume-$id" \
+              "$API/v1/machines/$id/resume" || echo 000)
+            echo "  resume HTTP $rcode: $(head -c 200 /tmp/res.out 2>/dev/null)"
+            [ "$rcode" = "200" ] || [ "$rcode" = "202" ] || { fail=1; continue; }
+            sleep 6
+
+            # 3) 确认 runStartedAt 已刷新、状态 running
+            after=$(curl -fsS -m 30 -H "X-API-Key: $KEY" "$API/v1/machines/$id")
+            astate=$(printf '%s' "$after" | jq -r '.state // .machine.state // empty')
+            astart=$(printf '%s' "$after" | jq -r '.runStartedAt // .machine.runStartedAt // empty')
+            echo "  after: state=$astate runStartedAt=$astart"
+            [ "$astate" = "running" ] || fail=1
+          done
+
+          [ "$fail" -eq 0 ] || { echo "some restarts failed"; exit 1; }
+          echo "== all machines runtime window refreshed =="
